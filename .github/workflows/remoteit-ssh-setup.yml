@@ -1,4 +1,4 @@
-name: Remote.it SSH Setup (Hardcoded Credentials) 
+name: Remote.it SSH Setup (with hardcoded creds placeholder)
 
 on:
   workflow_dispatch:
@@ -8,132 +8,132 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # ----------------------------
-    # !!! Hardcoded credentials !!!
-    # Replace the placeholder values below with your actual remote.it email/password.
-    # WARNING: This is insecure for public repositories.
-    # ----------------------------
     env:
-      REMOTEIT_EMAIL: "toxicvpsweb@gmail.com"
-      REMOTEIT_PASSWORD: "eT83FjV4cWaKD!5"
-      ROOT_PASS: "Root@12345"   # change this to a strong temporary password if needed
+      # Replace these placeholders with your actual remote.it credentials if you really want to hardcode.
+      # Strongly recommended: use GitHub Secrets instead of hardcoding.
+      REMOTEIT_EMAIL: "toxicvpsweb@gmail.com"       # Yahan apna remote.it email daalein
+      REMOTEIT_PASSWORD: "eT83FjV4cWaKD!5"  
+      ROOT_PASS: "Root@12345"
 
     steps:
       - name: Checkout (optional)
         uses: actions/checkout@v4
 
-      - name: 01/ Prepare Ubuntu & OpenSSH (set root password)
+      - name: Prepare Ubuntu & OpenSSH (set root password)
         run: |
           set -eux
           sudo apt-get update -y
           sudo apt-get install -y openssh-server curl ca-certificates file
           sudo mkdir -p /var/run/sshd
 
-          # set root password
+          # set root password (change ROOT_PASS env if needed)
           echo "root:${ROOT_PASS}" | sudo chpasswd
 
-          # enable root login and password auth (you can disable password auth later)
+          # Allow root login and password auth (you can tighten later)
           sudo sed -i 's/^#PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
           sudo sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
           sudo sed -i 's/^#PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
           sudo sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
 
           sudo systemctl restart ssh || sudo service ssh restart || true
+          echo "SSH ready: user=root password=${ROOT_PASS}"
 
-          echo "SSH server ready: user=root password=${ROOT_PASS}"
-
-      - name: 02/ Try download remote.it CLI tarball (best-effort)
-        id: install_remoteit
+      - name: Download remote.it CLI (tarball) - attempt
         run: |
           set -eux
           URL="https://downloads.remote.it/remoteit-cli/remoteit-cli-linux-amd64.tar.gz"
           OUT="remoteit-cli-linux-amd64.tar.gz"
-
-          echo "Downloading remote.it CLI from $URL"
+          echo "Downloading: $URL"
           if curl -fsSL "$URL" -o "$OUT"; then
             echo "Downloaded $OUT ($(stat -c%s "$OUT")) bytes"
             file "$OUT" || true
-
             if tar -tzf "$OUT" > /dev/null 2>&1; then
-              echo "Tarball is valid; extracting..."
               mkdir -p remoteit-cli
               tar -xzf "$OUT" -C remoteit-cli
               if [ -x remoteit-cli/remoteit ]; then
                 sudo mv -f remoteit-cli/remoteit /usr/local/bin/remoteit
                 sudo chmod +x /usr/local/bin/remoteit
-                echo "installed=true" >> "$GITHUB_OUTPUT"
+                echo "remoteit CLI installed to /usr/local/bin/remoteit"
               else
-                echo "Tarball extracted but binary not found inside."
+                echo "Tarball extracted but remoteit binary not found. Listing remoteit-cli:"
                 ls -la remoteit-cli || true
-                echo "installed=false" >> "$GITHUB_OUTPUT"
               fi
             else
-              echo "Downloaded file is not a gzip tarball. Showing head for debug:"
+              echo "Downloaded file is not a gzip tarball (likely HTML or redirect). Showing head for debug:"
               head -n 80 "$OUT" || true
-              echo "installed=false" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "curl download failed (network/URL issue)."
-            echo "installed=false" >> "$GITHUB_OUTPUT"
+            echo "curl failed to download tarball (network/URL issue)."
           fi
 
-      - name: 03/ Fallback: try connectd installer if CLI not installed
-        if: steps.install_remoteit.outputs.installed == 'false'
+      - name: Fallback installer (connectd) if CLI not present
         run: |
           set -eux
-          INST_URL="https://raw.githubusercontent.com/remoteit/install/master/install.sh"
-          echo "Downloading fallback installer from $INST_URL"
-          if curl -fsSL "$INST_URL" -o /tmp/remoteit-install.sh; then
-            chmod +x /tmp/remoteit-install.sh
-            # run installer in best-effort (may prompt in some versions)
-            sudo /tmp/remoteit-install.sh --install-only || true
-            if command -v connectd >/dev/null 2>&1 || command -v remoteit >/dev/null 2>&1; then
-              echo "fallback_installed=true" >> "$GITHUB_OUTPUT"
+          if ! command -v remoteit >/dev/null 2>&1; then
+            INST_URL="https://raw.githubusercontent.com/remoteit/install/master/install.sh"
+            echo "Attempting fallback installer from $INST_URL"
+            if curl -fsSL "$INST_URL" -o /tmp/remoteit-install.sh; then
+              chmod +x /tmp/remoteit-install.sh
+              # run best-effort; installer behavior may vary
+              sudo /tmp/remoteit-install.sh --install-only || true
+              if command -v connectd >/dev/null 2>&1 || command -v remoteit >/dev/null 2>&1; then
+                echo "Fallback installer completed and remote.it binary found."
+              else
+                echo "Fallback installer finished but no remote.it binary detected."
+              fi
             else
-              echo "fallback_installed=false" >> "$GITHUB_OUTPUT"
+              echo "Could not download fallback installer script (curl failed)."
             fi
           else
-            echo "Could not download fallback installer (curl failed)."
-            echo "fallback_installed=false" >> "$GITHUB_OUTPUT"
+            echo "remoteit CLI already installed; skipping fallback."
           fi
 
-      - name: 04/ Show remote.it CLI / connectd if present
+      - name: Show remote.it / connectd presence
         run: |
           if command -v remoteit >/dev/null 2>&1; then
-            echo "remoteit CLI at: $(which remoteit)"
+            echo "remoteit CLI found at: $(which remoteit)"
             remoteit --version || true
+          else
+            echo "remoteit CLI not found."
           fi
           if command -v connectd >/dev/null 2>&1; then
-            echo "connectd at: $(which connectd)"
+            echo "connectd found at: $(which connectd)"
             connectd -v || true
+          else
+            echo "connectd not found."
           fi
 
-      - name: 05/ Auto login to remote.it (using hardcoded env)
+      - name: Attempt non-interactive remote.it login (if CLI exists)
         run: |
           set -eux
-          # Use the env values defined in job env (hardcoded in this file)
           if command -v remoteit >/dev/null 2>&1; then
-            echo "Attempting non-interactive remoteit login..."
-            remoteit logout || true
-            remoteit login -e "${REMOTEIT_EMAIL}" -p "${REMOTEIT_PASSWORD}" || echo "remoteit login attempted (may require manual steps)"
-            echo "If login succeeded, register device and add SSH service via CLI or dashboard."
+            if [ -z "${REMOTEIT_EMAIL}" ] || [ -z "${REMOTEIT_PASSWORD}" ]; then
+              echo "REMOTEIT_EMAIL or REMOTEIT_PASSWORD empty; skipping login."
+            else
+              remoteit logout || true
+              # best-effort non-interactive login
+              remoteit login -e "${REMOTEIT_EMAIL}" -p "${REMOTEIT_PASSWORD}" || echo "remoteit login attempted (may require manual steps)."
+              echo "If login succeeded, use remoteit CLI or dashboard to register device and expose SSH."
+            fi
           else
-            echo "remoteit CLI not installed — skipping login attempt."
+            echo "remoteit CLI not available; cannot attempt login."
           fi
 
-      - name: 06/ Final instructions & SSH connect info
+      - name: Final instructions and SSH info
         run: |
           echo "=========================================="
-          echo "✅ SSH server is running on the GitHub runner"
+          echo "✅ SSH server is running on the runner"
           echo "User: root"
           echo "Password: ${ROOT_PASS}"
           echo ""
-          echo "If remote.it CLI installed and login succeeded, register a device and expose port 22:"
-          echo "  remoteit register-device -n \"GitHub-Runner-Ubuntu-SSH\""
+          echo "If remote.it CLI installed & logged in, register device and add SSH service (port 22):"
+          echo "  remoteit register-device -n 'GitHub-Runner-Ubuntu-SSH'"
           echo "  remoteit add-service --device <DEVICE-ID> --name SSH --protocol tcp --port 22 --local-port 22 --public-port 0"
           echo "  remoteit listen --device <DEVICE-ID> --service SSH"
           echo ""
-          echo "Or open https://remote.it dashboard, find the device, add SSH service (port 22) and connect from the remote.it app."
+          echo "Or go to https://remote.it dashboard, find the device, add SSH service, then connect via remote.it."
           echo ""
-          echo "⚠️ SECURITY: This runner is ephemeral (job timeout). Do NOT leave credentials in a public repo."
+          echo "Notes:"
+          echo " - Runner is ephemeral; job will stop after timeout (~30 min or what you set)."
+          echo " - Avoid hardcoding credentials in public repos."
           echo "=========================================="
