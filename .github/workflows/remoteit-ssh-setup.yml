@@ -1,139 +1,82 @@
-name: Remote.it SSH Setup (with hardcoded creds placeholder)
+name: Reverse SSH Tunnel with root access + optional remote.it
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
 
 jobs:
-  setup-remoteit-ssh:
+  reverse-ssh:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
 
     env:
-      # Replace these placeholders with your actual remote.it credentials if you really want to hardcode.
-      # Strongly recommended: use GitHub Secrets instead of hardcoding.
-      REMOTEIT_EMAIL: "toxicvpsweb@gmail.com"       # Yahan apna remote.it email daalein
-      REMOTEIT_PASSWORD: "eT83FjV4cWaKD!5"  
       ROOT_PASS: "Root@12345"
+      REMOTEIT_EMAIL: "toxicvpsweb@gmail.com"
+      REMOTEIT_PASSWORD: "eT83FjV4cWaKD!5"
 
     steps:
-      - name: Checkout (optional)
-        uses: actions/checkout@v4
-
-      - name: Prepare Ubuntu & OpenSSH (set root password)
+      - name: Install SSH & autossh
         run: |
-          set -eux
           sudo apt-get update -y
-          sudo apt-get install -y openssh-server curl ca-certificates file
+          sudo apt-get install -y openssh-server autossh curl file
           sudo mkdir -p /var/run/sshd
 
-          # set root password (change ROOT_PASS env if needed)
+      - name: Configure SSH (root + password login)
+        run: |
           echo "root:${ROOT_PASS}" | sudo chpasswd
+          sudo sed -i 's/^#PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh || sudo service ssh restart
+          echo "✅ SSH ready: root / ${ROOT_PASS}"
 
-          # Allow root login and password auth (you can tighten later)
-          sudo sed -i 's/^#PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-          sudo sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-          sudo sed -i 's/^#PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
-          sudo sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
-
-          sudo systemctl restart ssh || sudo service ssh restart || true
-          echo "SSH ready: user=root password=${ROOT_PASS}"
-
-      - name: Download remote.it CLI (tarball) - attempt
+      - name: Create SSH key for reverse tunnel
         run: |
-          set -eux
-          URL="https://downloads.remote.it/remoteit-cli/remoteit-cli-linux-amd64.tar.gz"
-          OUT="remoteit-cli-linux-amd64.tar.gz"
-          echo "Downloading: $URL"
-          if curl -fsSL "$URL" -o "$OUT"; then
-            echo "Downloaded $OUT ($(stat -c%s "$OUT")) bytes"
-            file "$OUT" || true
-            if tar -tzf "$OUT" > /dev/null 2>&1; then
-              mkdir -p remoteit-cli
-              tar -xzf "$OUT" -C remoteit-cli
-              if [ -x remoteit-cli/remoteit ]; then
-                sudo mv -f remoteit-cli/remoteit /usr/local/bin/remoteit
-                sudo chmod +x /usr/local/bin/remoteit
-                echo "remoteit CLI installed to /usr/local/bin/remoteit"
-              else
-                echo "Tarball extracted but remoteit binary not found. Listing remoteit-cli:"
-                ls -la remoteit-cli || true
-              fi
-            else
-              echo "Downloaded file is not a gzip tarball (likely HTML or redirect). Showing head for debug:"
-              head -n 80 "$OUT" || true
-            fi
+          mkdir -p ~/.ssh
+          ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa_revssh -q -N ""
+          chmod 600 ~/.ssh/id_rsa_revssh
+
+      - name: Start reverse SSH tunnel using autossh
+        run: |
+          nohup autossh -M 0 -N -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
+            -o "StrictHostKeyChecking=no" \
+            -i ~/.ssh/id_rsa_revssh -R 0:localhost:22 ssh.localhost.run > revssh.log 2>&1 &
+          sleep 8
+
+      - name: Parse reverse tunnel info
+        run: |
+          LOG=revssh.log
+          HOSTPORT=$(grep -Eo '([0-9a-zA-Z.-]+:[0-9]{3,6})' "$LOG" | grep 'localhost.run' | head -n1 || true)
+          if [ -n "$HOSTPORT" ]; then
+            HOST=$(echo "$HOSTPORT" | cut -d: -f1)
+            PORT=$(echo "$HOSTPORT" | cut -d: -f2)
+            echo "✅ SSH tunnel established"
+            echo "Host: $HOST"
+            echo "Port: $PORT"
+            echo "User: root"
+            echo "Password: ${ROOT_PASS}"
+            echo "SSH command: ssh root@${HOST} -p ${PORT}"
           else
-            echo "curl failed to download tarball (network/URL issue)."
+            echo "❌ Could not parse tunnel host/port"
+            head -n 50 revssh.log || true
+            exit 1
           fi
 
-      - name: Fallback installer (connectd) if CLI not present
-        run: |
-          set -eux
-          if ! command -v remoteit >/dev/null 2>&1; then
-            INST_URL="https://raw.githubusercontent.com/remoteit/install/master/install.sh"
-            echo "Attempting fallback installer from $INST_URL"
-            if curl -fsSL "$INST_URL" -o /tmp/remoteit-install.sh; then
-              chmod +x /tmp/remoteit-install.sh
-              # run best-effort; installer behavior may vary
-              sudo /tmp/remoteit-install.sh --install-only || true
-              if command -v connectd >/dev/null 2>&1 || command -v remoteit >/dev/null 2>&1; then
-                echo "Fallback installer completed and remote.it binary found."
-              else
-                echo "Fallback installer finished but no remote.it binary detected."
-              fi
-            else
-              echo "Could not download fallback installer script (curl failed)."
-            fi
-          else
-            echo "remoteit CLI already installed; skipping fallback."
-          fi
+# Optional: if remote.it CLI starts working again, you can uncomment this block
+#      - name: Login to remote.it CLI (optional fallback)
+#        run: |
+#          curl -fsSL https://raw.githubusercontent.com/remoteit/install/master/install.sh -o install.sh
+#          chmod +x install.sh
+#          sudo ./install.sh --install-only
+#          if command -v remoteit >/dev/null; then
+#            remoteit login -e "$REMOTEIT_EMAIL" -p "$REMOTEIT_PASSWORD"
+#          else
+#            echo "remoteit CLI not available"
+#          fi
 
-      - name: Show remote.it / connectd presence
+      - name: Keep alive until timeout
         run: |
-          if command -v remoteit >/dev/null 2>&1; then
-            echo "remoteit CLI found at: $(which remoteit)"
-            remoteit --version || true
-          else
-            echo "remoteit CLI not found."
-          fi
-          if command -v connectd >/dev/null 2>&1; then
-            echo "connectd found at: $(which connectd)"
-            connectd -v || true
-          else
-            echo "connectd not found."
-          fi
-
-      - name: Attempt non-interactive remote.it login (if CLI exists)
-        run: |
-          set -eux
-          if command -v remoteit >/dev/null 2>&1; then
-            if [ -z "${REMOTEIT_EMAIL}" ] || [ -z "${REMOTEIT_PASSWORD}" ]; then
-              echo "REMOTEIT_EMAIL or REMOTEIT_PASSWORD empty; skipping login."
-            else
-              remoteit logout || true
-              # best-effort non-interactive login
-              remoteit login -e "${REMOTEIT_EMAIL}" -p "${REMOTEIT_PASSWORD}" || echo "remoteit login attempted (may require manual steps)."
-              echo "If login succeeded, use remoteit CLI or dashboard to register device and expose SSH."
-            fi
-          else
-            echo "remoteit CLI not available; cannot attempt login."
-          fi
-
-      - name: Final instructions and SSH info
-        run: |
-          echo "=========================================="
-          echo "✅ SSH server is running on the runner"
-          echo "User: root"
-          echo "Password: ${ROOT_PASS}"
-          echo ""
-          echo "If remote.it CLI installed & logged in, register device and add SSH service (port 22):"
-          echo "  remoteit register-device -n 'GitHub-Runner-Ubuntu-SSH'"
-          echo "  remoteit add-service --device <DEVICE-ID> --name SSH --protocol tcp --port 22 --local-port 22 --public-port 0"
-          echo "  remoteit listen --device <DEVICE-ID> --service SSH"
-          echo ""
-          echo "Or go to https://remote.it dashboard, find the device, add SSH service, then connect via remote.it."
-          echo ""
-          echo "Notes:"
-          echo " - Runner is ephemeral; job will stop after timeout (~30 min or what you set)."
-          echo " - Avoid hardcoding credentials in public repos."
-          echo "=========================================="
+          echo "💡 Runner will stay alive up to 6 hours unless cancelled."
+          sleep 3
