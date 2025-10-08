@@ -1,82 +1,129 @@
-name: Reverse SSH Tunnel with root access + optional remote.it
+name: Reverse SSH (Serveo, password auth)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */6 * * *'   # every 6 hours
 
 jobs:
-  reverse-ssh:
+  serveo-reverse-ssh:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
-      ROOT_PASS: "Root@12345"
-      REMOTEIT_EMAIL: "toxicvpsweb@gmail.com"
-      REMOTEIT_PASSWORD: "eT83FjV4cWaKD!5"
+      ROOT_PASS: "Root@12345"   # CHANGE this to a strong temporary password before using
 
     steps:
-      - name: Install SSH & autossh
+      - name: Install SSH & tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y openssh-server autossh curl file
+          sudo apt-get install -y openssh-server openssh-client
           sudo mkdir -p /var/run/sshd
 
-      - name: Configure SSH (root + password login)
+      - name: Configure SSH (enable root + password)
         run: |
           echo "root:${ROOT_PASS}" | sudo chpasswd
-          sudo sed -i 's/^#PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh || sudo service ssh restart
-          echo "✅ SSH ready: root / ${ROOT_PASS}"
+          sudo sed -i 's/^#PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo systemctl restart ssh || sudo service ssh restart || true
+          echo "SSH configured: root / ${ROOT_PASS}"
 
-      - name: Create SSH key for reverse tunnel
+      - name: Attempt serveo reverse tunnel (retries)
+        id: serveo
         run: |
-          mkdir -p ~/.ssh
-          ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa_revssh -q -N ""
-          chmod 600 ~/.ssh/id_rsa_revssh
+          set -eux
 
-      - name: Start reverse SSH tunnel using autossh
-        run: |
-          nohup autossh -M 0 -N -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
-            -o "StrictHostKeyChecking=no" \
-            -i ~/.ssh/id_rsa_revssh -R 0:localhost:22 ssh.localhost.run > revssh.log 2>&1 &
-          sleep 8
+          LOG=serveo.log
+          MAX_RETRIES=5
+          SLEEP_BEFORE_CHECK=8
 
-      - name: Parse reverse tunnel info
-        run: |
-          LOG=revssh.log
-          HOSTPORT=$(grep -Eo '([0-9a-zA-Z.-]+:[0-9]{3,6})' "$LOG" | grep 'localhost.run' | head -n1 || true)
-          if [ -n "$HOSTPORT" ]; then
-            HOST=$(echo "$HOSTPORT" | cut -d: -f1)
-            PORT=$(echo "$HOSTPORT" | cut -d: -f2)
-            echo "✅ SSH tunnel established"
-            echo "Host: $HOST"
-            echo "Port: $PORT"
-            echo "User: root"
-            echo "Password: ${ROOT_PASS}"
-            echo "SSH command: ssh root@${HOST} -p ${PORT}"
-          else
-            echo "❌ Could not parse tunnel host/port"
-            head -n 50 revssh.log || true
+          # ensure old log removed
+          rm -f "$LOG"
+
+          success=0
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "--- Attempt $i of $MAX_RETRIES to start serveo tunnel ---"
+            # kill any existing background ssh to serveo
+            pkill -f "ssh .*serveo.net" || true
+
+            # Start ssh reverse forward in background; ExitOnForwardFailure ensures it exits if remote cannot allocate forward
+            nohup ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o ExitOnForwardFailure=yes -R 0:localhost:22 serveo.net > "$LOG" 2>&1 &
+            s_pid=$!
+            echo "Started ssh (PID $s_pid), waiting ${SLEEP_BEFORE_CHECK}s for allocation..."
+            sleep $SLEEP_BEFORE_CHECK
+
+            # Check log for forwarding line
+            if grep -Eqi 'Forwarding (TCP|connections|connections from) .*serveo.net' "$LOG" 2>/dev/null; then
+              echo "Forwarding line found in log:"
+              grep -Ei 'Forwarding .*serveo.net' "$LOG" | sed -n '1,20p' || true
+              success=1
+              break
+            fi
+
+            # Some variants print "Allocated port <n>"
+            PORT_LINE=$(grep -Eo 'Allocated port [0-9]+' "$LOG" | head -n1 || true)
+            if [ -n "$PORT_LINE" ]; then
+              echo "Found: $PORT_LINE"
+              success=1
+              break
+            fi
+
+            # If log contains "Allocated port 0" it's failure (remote refused)
+            if grep -q 'Allocated port 0' "$LOG" 2>/dev/null; then
+              echo "Remote allocated port 0 (failure). Killing pid $s_pid and retrying..."
+              kill $s_pid || true
+              sleep 3
+              continue
+            fi
+
+            # If no useful info, show some log snippet for debugging and retry
+            echo "No forwarding info yet, log snippet:"
+            tail -n 80 "$LOG" || true
+            echo "Killing pid $s_pid and retrying..."
+            kill $s_pid || true
+            sleep 3
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "ERROR: All attempts failed to obtain a public port from serveo."
+            echo "Final log:"
+            cat "$LOG" || true
             exit 1
           fi
 
-# Optional: if remote.it CLI starts working again, you can uncomment this block
-#      - name: Login to remote.it CLI (optional fallback)
-#        run: |
-#          curl -fsSL https://raw.githubusercontent.com/remoteit/install/master/install.sh -o install.sh
-#          chmod +x install.sh
-#          sudo ./install.sh --install-only
-#          if command -v remoteit >/dev/null; then
-#            remoteit login -e "$REMOTEIT_EMAIL" -p "$REMOTEIT_PASSWORD"
-#          else
-#            echo "remoteit CLI not available"
-#          fi
+          # extract host:port — common lines:
+          # "Forwarding TCP connections from 0.tcp.serveo.net:12345"
+          HOSTPORT=$(grep -Eo '([0-9a-zA-Z.-]+:[0-9]{3,6})' "$LOG" | grep -E 'serveo.net|tcp.serveo.net' | head -n1 || true)
+          if [ -z "$HOSTPORT" ]; then
+            # fallback: find Allocated port <n> and assume host 0.tcp.serveo.net
+            PORT=$(grep -Eo 'Allocated port [0-9]+' "$LOG" | grep -Eo '[0-9]+' | head -n1 || true)
+            if [ -n "$PORT" ]; then
+              HOSTPORT="0.tcp.serveo.net:${PORT}"
+            fi
+          fi
 
-      - name: Keep alive until timeout
+          if [ -z "$HOSTPORT" ]; then
+            echo "Could not parse host:port from serveo.log — showing file for debugging:"
+            cat "$LOG" || true
+            exit 1
+          fi
+
+          echo "Found host:port -> $HOSTPORT"
+          echo "::set-output name=hostport::$HOSTPORT"
+
+      - name: Show SSH connection info
         run: |
-          echo "💡 Runner will stay alive up to 6 hours unless cancelled."
-          sleep 3
+          HP="${{ steps.serveo.outputs.hostport }}"
+          HOST=$(echo "$HP" | cut -d: -f1)
+          PORT=$(echo "$HP" | cut -d: -f2)
+          echo "=================================="
+          echo "SSH Host: $HOST"
+          echo "SSH Port: $PORT"
+          echo "User: root"
+          echo "Password: ${ROOT_PASS}"
+          echo ""
+          echo "Connect from phone or desktop:"
+          echo "ssh root@${HOST} -p ${PORT}"
+          echo "=================================="
